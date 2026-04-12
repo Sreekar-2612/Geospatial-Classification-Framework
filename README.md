@@ -79,7 +79,7 @@ Open a browser session and upload a sample `.jpg` from your `data/processed/` re
 ---
 
 ## 📈 Quality Benchmarks
-To guarantee **S-Grade output metrics**, the following performance indicators are persistently tracked and heavily scrutinized:
+To guarantee **quality output** , the following performance indicators are persistently tracked and heavily scrutinized:
 - **CNN Classification Accuracy**: Aiming exceptionally high (>95%).
 - **Geometric Intersection (IoU)**: Evaluates semantic map overlap.
 - **Interpretability Checks**: Verifying whether GradCAM heatmaps align physically with what a human observer registers as the dominant geographical entity.
