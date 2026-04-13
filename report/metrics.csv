@@ -1,4 +1,5 @@
 Model,Accuracy,Macro F1,Mean IoU,Kappa
-Gradient Boosting (XGB),0.912,0.895,0.880,0.875
-ResNet-18 (CNN),0.2319,0.1489,0.0873,-0.0032
-K-Means (DIP),0.4780,0.2528,0.1848,0.2193
+Gradient Boosting (XGB),0.912,0.895,0.88,0.875
+DIP Features + RF,0.9811,0.9776,0.9568,0.9745
+ResNet-18 (CNN),0.4681,0.2661,0.1814,0.2178
+K-Means (DIP),0.478,0.2528,0.1848,0.2193

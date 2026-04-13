@@ -17,9 +17,13 @@ def extract_lulc_features(img_np):
     # 1. Color Features (Means & Stds) - 6 features
     color_features = np.hstack([np.mean(img_rgb, axis=(0, 1)), np.std(img_rgb, axis=(0, 1))])
     
-    # 2. GLCM Texture - 4 features
-    glcm = graycomatrix(gray, [1], [0], 256, symmetric=True, normed=True)
-    glcm_features = [graycoprops(glcm, p)[0, 0] for p in ['contrast', 'energy', 'homogeneity', 'correlation']]
+    # 2. GLCM Texture (multi-angle) - 16 features (4 props x 4 angles)
+    angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+    glcm = graycomatrix(gray, [1], angles, 256, symmetric=True, normed=True)
+    glcm_features = []
+    for prop in ['contrast', 'energy', 'homogeneity', 'correlation']:
+        vals = graycoprops(glcm, prop)[0]
+        glcm_features.extend(vals)
     
     # 3. LBP Texture (Uniform) - 26 features
     lbp = local_binary_pattern(gray, 24, 3, method='uniform')
@@ -31,20 +35,12 @@ def extract_lulc_features(img_np):
     hog_features = hog(gray, orientations=8, pixels_per_cell=(16, 16),
                       cells_per_block=(1, 1), visualize=False)
     
-    # 5. Advanced Spectral Indices (RGB-based surrogates) - 4 features
-    # Helps distinguish Water (high relative Blue) from Shadows (neutral low intensity)
-    R, G, B = img_rgb[:,:,0].astype(float), img_rgb[:,:,1].astype(float), img_rgb[:,:,2].astype(float)
-    total = R + G + B + 1e-6
+    # 5. Pseudo-NDVI Statistics - 4 features
+    R = img_rgb[:, :, 0].astype(np.float32)
+    G = img_rgb[:, :, 1].astype(np.float32)
+    denom = G + R
+    denom[denom == 0] = 1.0
+    ndvi = (G - R) / denom
+    ndvi_features = np.array([ndvi.mean(), ndvi.std(), ndvi.min(), ndvi.max()])
     
-    # Excess Blue Index (targets Water)
-    exb = np.mean((2*B - R - G) / total)
-    # Blue/Red Ratio (Water usually has higher B/R than shadows)
-    br_ratio = np.mean(B / (R + 1e-6))
-    # Excess Green Index (targets Vegetation vs shadows)
-    exg = np.mean((2*G - R - B) / total)
-    # Overall Intensity (Shadows are darker than most water)
-    intensity = np.mean(gray) / 255.0
-    
-    spectral_features = [exb, br_ratio, exg, intensity]
-    
-    return np.hstack([color_features, glcm_features, lbp_hist, hog_features, spectral_features])
+    return np.hstack([color_features, glcm_features, lbp_hist, hog_features, ndvi_features])

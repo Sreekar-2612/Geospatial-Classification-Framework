@@ -25,11 +25,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, models, transforms
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+from collections import Counter
 
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
@@ -57,19 +60,23 @@ def download_eurosat():
         print(f"Data already exists at {DATA_DIR}")
         return
 
-    print("Downloading EuroSAT RGB dataset (~90 MB)...")
     zip_path = PROJECT_ROOT / "EuroSAT.zip"
-    url = "https://madm.dfki.de/files/sentinel/EuroSAT.zip"
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx)
-    )
-    urllib.request.install_opener(opener)
+    if not zip_path.exists():
+        print("Downloading EuroSAT RGB dataset (~90 MB)...")
+        url = "https://madm.dfki.de/files/sentinel/EuroSAT.zip"
 
-    urllib.request.urlretrieve(url, str(zip_path))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+        urllib.request.install_opener(opener)
+
+        urllib.request.urlretrieve(url, str(zip_path))
+    else:
+        print(f"Using existing {zip_path}")
 
     print("Extracting...")
     raw_dir = PROJECT_ROOT / "EuroSAT_raw"
@@ -82,7 +89,6 @@ def download_eurosat():
         if cls_dir.is_dir():
             shutil.copytree(str(cls_dir), str(DATA_DIR / cls_dir.name))
 
-    zip_path.unlink(missing_ok=True)
     shutil.rmtree(str(raw_dir), ignore_errors=True)
 
     classes = sorted([d.name for d in DATA_DIR.iterdir() if d.is_dir()])
@@ -125,7 +131,7 @@ def build_mapped_dataset():
 
 
 def train_rf(mapped_dir):
-    """Train Random Forest model using hand-crafted features."""
+    """Train Random Forest model using hand-crafted features with StandardScaler."""
     print("\n" + "=" * 60)
     print("Training Random Forest Model")
     print("=" * 60)
@@ -139,7 +145,7 @@ def train_rf(mapped_dir):
 
     print(f"Feature extraction for classes: {classes}")
     for i, cls in enumerate(classes):
-        paths = list((mapped_dir / cls).glob("*.jpg"))[:500]
+        paths = list((mapped_dir / cls).glob("*.jpg"))
         for img_path in tqdm(paths, desc=f"  {cls}"):
             img = cv2.imread(str(img_path))
             if img is not None:
@@ -156,8 +162,19 @@ def train_rf(mapped_dir):
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    print("Training Random Forest (n_estimators=100)...")
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    print("Training Random Forest (n_estimators=300, balanced)...")
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_split=5,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
     rf.fit(X_train, y_train)
 
     acc = accuracy_score(y_test, rf.predict(X_test))
@@ -167,66 +184,134 @@ def train_rf(mapped_dir):
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     rf_path = MODELS_DIR / "rf_baseline.joblib"
+    scaler_path = MODELS_DIR / "rf_scaler.joblib"
     joblib.dump(rf, rf_path)
+    joblib.dump(scaler, scaler_path)
     print(f"Random Forest saved to {rf_path}")
+    print(f"Scaler saved to {scaler_path}")
 
     return acc
 
 
 def train_cnn(mapped_dir):
-    """Train CNN (ResNet-18) model."""
+    """Train CNN (ResNet-18) with class-balanced sampling, strong augmentation,
+    cosine LR, and a two-phase freeze/unfreeze strategy."""
     print("\n" + "=" * 60)
-    print("Training CNN (ResNet-18) Model")
+    print("Training CNN (ResNet-18) Model — Tuned")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(30),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.15, scale=(0.02, 0.15)),
+    ])
+
+    eval_transform = transforms.Compose([
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    full_dataset = datasets.ImageFolder(str(mapped_dir), transform=transform)
+    full_dataset = datasets.ImageFolder(str(mapped_dir), transform=None)
     class_names = full_dataset.classes
     num_classes = len(class_names)
     print(f"Classes: {class_names} ({num_classes} classes)")
 
-    train_size = int(0.8 * len(full_dataset))
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, test_size],
+    total = len(full_dataset)
+    train_size = int(0.7 * total)
+    val_size = int(0.1 * total)
+    test_size = total - train_size - val_size
+
+    gen = torch.Generator().manual_seed(42)
+    train_subset, val_subset, test_subset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size, test_size], generator=gen,
+    )
+
+    # --- Class-balanced WeightedRandomSampler for training ---
+    train_labels = [full_dataset.targets[i] for i in train_subset.indices]
+    class_counts = Counter(train_labels)
+    print(f"Train class distribution: {dict(sorted(class_counts.items()))}")
+    weight_per_class = {c: 1.0 / count for c, count in class_counts.items()}
+    sample_weights = [weight_per_class[label] for label in train_labels]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
         generator=torch.Generator().manual_seed(42),
     )
 
-    if device.type == "cpu":
-        num_epochs = 3
-        batch_sz = 16
-        print(f"CPU mode: training for {num_epochs} epochs with batch size {batch_sz}")
-    else:
-        num_epochs = 5
-        batch_sz = 32
-        print(f"GPU mode: training for {num_epochs} epochs with batch size {batch_sz}")
+    # Class-weighted loss as secondary balance signal
+    class_weight_tensor = torch.tensor(
+        [1.0 / class_counts.get(i, 1) for i in range(num_classes)], dtype=torch.float32
+    )
+    class_weight_tensor = class_weight_tensor / class_weight_tensor.sum() * num_classes
+    class_weight_tensor = class_weight_tensor.to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_sz, shuffle=True, num_workers=0)
+    train_dataset = _TransformSubset(train_subset, train_transform)
+    val_dataset = _TransformSubset(val_subset, eval_transform)
+    test_dataset = _TransformSubset(test_subset, eval_transform)
+
+    if device.type == "cpu":
+        num_epochs = 20
+        batch_sz = 32
+    else:
+        num_epochs = 30
+        batch_sz = 64
+    freeze_epochs = 5
+    print(f"Training for {num_epochs} epochs (backbone frozen for first {freeze_epochs}), batch size {batch_sz}")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_sz, sampler=sampler, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_sz, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=batch_sz, shuffle=False, num_workers=0)
 
+    # --- Model setup with two-phase freeze/unfreeze ---
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     model = model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.fc.parameters():
+        param.requires_grad = True
 
-    best_acc = 0.0
+    criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
+
+    optimizer = optim.AdamW(model.fc.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+
+    best_val_acc = 0.0
+    patience_counter = 0
+    early_stop_patience = 8
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODELS_DIR / "cnn_final.pth"
 
     for epoch in range(num_epochs):
+        # Phase 2: unfreeze backbone after freeze_epochs
+        if epoch == freeze_epochs:
+            print(f"\n  >>> Unfreezing backbone at epoch {epoch + 1}")
+            for param in model.parameters():
+                param.requires_grad = True
+            optimizer = optim.AdamW([
+                {"params": model.fc.parameters(), "lr": 5e-4},
+                {"params": (p for n, p in model.named_parameters()
+                            if "fc" not in n and p.requires_grad), "lr": 5e-5},
+            ], weight_decay=1e-4)
+            scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - freeze_epochs, eta_min=1e-6)
+
         model.train()
         running_loss = 0.0
         running_corrects = 0
+        n_samples = 0
 
         pbar = tqdm(train_loader, desc=f"  Epoch {epoch + 1}/{num_epochs}")
         for inputs, labels in pbar:
@@ -239,20 +324,44 @@ def train_cnn(mapped_dir):
             optimizer.step()
 
             running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
+            running_corrects += torch.sum(preds == labels.data).item()
+            n_samples += inputs.size(0)
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        epoch_loss = running_loss / train_size
-        epoch_acc = running_corrects.double() / train_size
-        print(f"  Epoch {epoch + 1}/{num_epochs} - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.4f}")
+        scheduler.step()
 
-        if epoch_acc > best_acc:
-            best_acc = epoch_acc
+        epoch_loss = running_loss / n_samples
+        epoch_acc = running_corrects / n_samples
+
+        model.eval()
+        val_corrects = 0
+        val_total = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                val_corrects += torch.sum(preds == labels).item()
+                val_total += labels.size(0)
+        val_acc = val_corrects / val_total
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"  Epoch {epoch + 1}/{num_epochs} — Loss: {epoch_loss:.4f}, "
+              f"Train Acc: {epoch_acc:.4f}, Val Acc: {val_acc:.4f}, LR: {lr_now:.6f}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
             torch.save(model.state_dict(), model_path)
-            print(f"  -> Saved best model (acc={best_acc:.4f})")
+            print(f"  -> Saved best model (val_acc={best_val_acc:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"  Early stopping at epoch {epoch + 1} (no improvement for {early_stop_patience} epochs)")
+                break
 
     print(f"\nEvaluating on test set...")
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
     all_preds = []
@@ -272,6 +381,23 @@ def train_cnn(mapped_dir):
     print(f"CNN model saved to {model_path}")
 
     return test_acc
+
+
+class _TransformSubset(torch.utils.data.Dataset):
+    """Wraps a Subset to apply a specific transform to PIL images."""
+
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img, label = self.subset[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
 
 def update_metrics(rf_acc, cnn_acc):

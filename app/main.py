@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import sys
 import joblib
+import io
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -11,13 +12,16 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 from pathlib import Path
+from datetime import datetime
 from scipy.stats import chi2_contingency
-from skimage.feature import graycomatrix, graycoprops
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern, hog
+from sklearn.metrics import precision_recall_fscore_support
 
 # Path fixes
 sys.path.append(str(Path(__file__).parents[1]))
 from src.features import extract_lulc_features
 from src.utils import METRICS_PATH
+from src.gradcam import GradCAM, overlay_cam_on_image
 
 # --- Setup ---
 st.set_page_config(page_title="LULC Intelligence Dashboard", layout="wide")
@@ -51,7 +55,12 @@ TARGET_CLASSES_LIST = [
 @st.cache_resource
 def load_rf():
     path = MODELS_DIR / "rf_baseline.joblib"
-    return joblib.load(path) if path.exists() else None
+    scaler_path = MODELS_DIR / "rf_scaler.joblib"
+    if not path.exists():
+        return None, None
+    model = joblib.load(path)
+    scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+    return model, scaler
 
 @st.cache_resource
 def load_cnn():
@@ -69,7 +78,7 @@ def load_cnn():
     model.eval()
     return model, device
 
-rf_model = load_rf()
+rf_model, rf_scaler = load_rf()
 cnn_model, cnn_device = load_cnn()
 
 CNN_TRANSFORM = transforms.Compose([
@@ -78,88 +87,227 @@ CNN_TRANSFORM = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-def calibrate_probs(probs, img_np):
-    """
-    S-Grade Intelligence Layer: Uses Spatial Consensus (K-Means pixel counts)
-    to calibrate global model reports.
-    """
-    new_probs = probs.copy()
-    
-    # 1. Capture Spatial Evidence (Pixel Counts)
-    # We use a fast, cached version of our segmentation logic
-    try:
-        # Run a micro-segmentation to get pixel distribution
+TTA_TRANSFORMS = [
+    CNN_TRANSFORM,
+    transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomHorizontalFlip(p=1.0),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomVerticalFlip(p=1.0),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomRotation((90, 90)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+    transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomRotation((270, 270)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]),
+]
+
+CONFUSION_RF_PATH = Path(__file__).parents[1] / "report" / "confusion_rf.csv"
+CONFUSION_CNN_PATH = Path(__file__).parents[1] / "report" / "confusion_cnn.csv"
+
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+
+def pil_to_png_bytes(img_pil):
+    buf = io.BytesIO()
+    img_pil.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def np_rgb_to_png_bytes(img_np):
+    buf = io.BytesIO()
+    Image.fromarray(img_np.astype(np.uint8)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def dataframe_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def get_feature_group_importance(importances):
+    groups = {
+        "Color Stats": (0, 6),
+        "GLCM": (6, 22),
+        "LBP": (22, 48),
+        "HOG": (48, 176),
+        "Pseudo-NDVI": (176, 180),
+    }
+    rows = []
+    for name, (start, end) in groups.items():
+        rows.append({"Group": name, "Importance": float(importances[start:end].sum())})
+    return pd.DataFrame(rows)
+
+
+def get_feature_names():
+    names = [
+        "mean_R",
+        "mean_G",
+        "mean_B",
+        "std_R",
+        "std_G",
+        "std_B",
+    ]
+    for prop in ["contrast", "energy", "homogeneity", "correlation"]:
+        for angle in ["0", "45", "90", "135"]:
+            names.append(f"glcm_{prop}_{angle}")
+    for i in range(26):
+        names.append(f"lbp_bin_{i}")
+    for i in range(128):
+        names.append(f"hog_{i}")
+    names.extend(["ndvi_mean", "ndvi_std", "ndvi_min", "ndvi_max"])
+    return names
+
+
+def render_dip_feature_breakdown(img_np):
+    with st.expander("DIP Feature Breakdown"):
         gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        R, G, B = img_np[:,:,0].astype(float), img_np[:,:,1].astype(float), img_np[:,:,2].astype(float)
-        
-        # Simple clustering proxy: Check dominant colors
-        # Agriculture(0), Buildings(1), Forest(2), Roads(3), Water(4)
-        # EuroSAT-style centroids
-        centroids = {
-            0: [80, 100, 60],  # Agri
-            1: [120, 120, 120], # Build
-            2: [40, 60, 40],   # Forest
-            3: [100, 100, 110], # Roads
-            4: [30, 50, 80]    # Water
-        }
-        
-        # Calculate pixel-wise distance to centroids (highly optimized)
-        # For large images, we sub-sample to 128x128 for speed
-        img_small = cv2.resize(img_np, (128, 128))
-        pixels = img_small.reshape(-1, 3).astype(float)
-        
-        pixel_votes = np.zeros(len(probs))
-        for idx, color in centroids.items():
-            dist = np.linalg.norm(pixels - color, axis=1)
-            # Find pixels where this class is the winner
-            # (Simplification for speed)
-            if idx < len(probs):
-                pixel_votes[idx] = np.sum(dist < 50) # Count "good matches"
-                
-        # Normalize votes to a bias vector
-        spatial_prior = pixel_votes / (np.sum(pixel_votes) + 1e-6)
-        
-        # 2. Apply Consensus: Blend Global Model with Local Spatial Evidence
-        # If the spatial evidence is strong (>20% of pixels fixed on a class), boost it
-        for i in range(len(new_probs)):
-            if spatial_prior[i] > 0.2:
-                new_probs[i] *= (1.0 + spatial_prior[i] * 2.0)
-                
-    except Exception as e:
-        pass # Fallback to original probs if segmentation fails
-        
-    # 3. Intensity-based Shadow Correction (keep prev logic)
-    mean_intensity = np.mean(cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY))
-    if mean_intensity < 80:
-        new_probs[4] *= 0.5 # Penalty for Water in dark images
-        
-    # Normalize to 1.0
-    return new_probs / (np.sum(new_probs) + 1e-9)
+        c1, c2 = st.columns(2)
+        c3, c4 = st.columns(2)
+
+        with c1:
+            glcm = graycomatrix(gray, [1], [0], 256, symmetric=True, normed=True)
+            energy = graycoprops(glcm, "energy")[0][0]
+            contrast = graycoprops(glcm, "contrast")[0][0]
+            glcm_display = cv2.normalize(gray.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            st.image(glcm_display, caption=f"GLCM proxy map | energy={energy:.4f}, contrast={contrast:.2f}", use_container_width=True)
+
+        with c2:
+            lbp = local_binary_pattern(gray, 24, 3, method="uniform")
+            lbp_hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 27), range=(0, 26))
+            lbp_hist = lbp_hist / (lbp_hist.sum() + 1e-6)
+            lbp_df = pd.DataFrame({"Bin": list(range(26)), "Frequency": lbp_hist})
+            fig_lbp = px.bar(lbp_df, x="Bin", y="Frequency", title="LBP Histogram (26 bins)")
+            fig_lbp.update_layout(height=280, margin=dict(l=0, r=0, t=35, b=0))
+            st.plotly_chart(fig_lbp, use_container_width=True)
+
+        with c3:
+            _, hog_vis = hog(
+                gray,
+                orientations=8,
+                pixels_per_cell=(16, 16),
+                cells_per_block=(1, 1),
+                visualize=True,
+            )
+            hog_vis = cv2.normalize(hog_vis, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            st.image(hog_vis, caption="HOG Orientation Overlay", use_container_width=True)
+
+        with c4:
+            R = img_np[:, :, 0].astype(np.float32)
+            G = img_np[:, :, 1].astype(np.float32)
+            denom = G + R
+            denom[denom == 0] = 1
+            ndvi = (G - R) / denom
+            m1, m2 = st.columns(2)
+            m3, m4 = st.columns(2)
+            m1.metric("NDVI Mean", f"{ndvi.mean():.4f}")
+            m2.metric("NDVI Std", f"{ndvi.std():.4f}")
+            m3.metric("NDVI Min", f"{ndvi.min():.4f}")
+            m4.metric("NDVI Max", f"{ndvi.max():.4f}")
+
+
+def get_gradcam_overlay(img_pil, pred_idx):
+    if cnn_model is None:
+        return None
+    cam = GradCAM(cnn_model, cnn_model.layer4[-1])
+    tensor = CNN_TRANSFORM(img_pil).unsqueeze(0).to(cnn_device)
+    cam_map = cam.generate(tensor, class_idx=pred_idx)
+    return overlay_cam_on_image(np.array(img_pil), cam_map, alpha=0.4)
+
+
+def load_confusion_matrix(path):
+    if path.exists():
+        return pd.read_csv(path, index_col=0)
+    return None
+
+
+def get_ensemble_prediction(img_np, img_pil, use_tta=False, rf_weight=0.4):
+    pred_rf, probs_rf, rf_is_fallback = predict_rf(img_np)
+    pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img_pil, use_tta=use_tta)
+    available = []
+    if probs_rf is not None:
+        available.append(("rf", probs_rf))
+    if probs_cnn is not None:
+        available.append(("cnn", probs_cnn))
+    if len(available) == 1:
+        model_name, probs = available[0]
+        return int(probs.argmax()), probs, model_name, rf_is_fallback, cnn_is_fallback
+
+    cnn_weight = 1.0 - rf_weight
+    probs = rf_weight * probs_rf + cnn_weight * probs_cnn
+    return int(probs.argmax()), probs, "ensemble", rf_is_fallback, cnn_is_fallback
+
+def predict_fallback_from_segmentation(img_np):
+    label_to_class = {
+        "Buildings/Urban": "Buildings",
+        "Roads/Pavement": "Roads",
+        "Forest/Parks": "Forest",
+        "Water Bodies": "Water",
+        "Agriculture/Grass": "Agriculture",
+    }
+    scores = np.ones(len(CLASSES), dtype=np.float32) * 1e-6
+    class_to_idx = {name: i for i, name in enumerate(CLASSES)}
+
+    masks, _ = get_class_masks(img_np, k=8, apply_smoothing=False)
+    for label_name, colored_mask in masks.items():
+        mapped_class = label_to_class.get(label_name)
+        if mapped_class is None:
+            continue
+        mask_pixels = int(np.any(colored_mask != 0, axis=2).sum())
+        if mask_pixels > 0:
+            scores[class_to_idx[mapped_class]] += mask_pixels
+
+    probs = scores / scores.sum()
+    pred_idx = int(np.argmax(probs))
+    return pred_idx, probs
+
 
 def predict_rf(img_np):
     if rf_model is None:
         pred_idx, probs = predict_fallback_from_segmentation(img_np)
         return pred_idx, probs, True
     feat = extract_lulc_features(img_np)
-    pred_idx = rf_model.predict([feat])[0]
-    probs = rf_model.predict_proba([feat])[0]
-    
-    # Apply Calibration
-    probs = calibrate_probs(probs, img_np)
-    return int(np.argmax(probs)), probs
+    feat_arr = np.array([feat])
+    if rf_scaler is not None:
+        feat_arr = rf_scaler.transform(feat_arr)
+    pred_idx = rf_model.predict(feat_arr)[0]
+    probs = rf_model.predict_proba(feat_arr)[0]
+    return pred_idx, probs, False
 
-def predict_cnn(img_pil):
+def predict_cnn(img_pil, use_tta=False):
     if cnn_model is None:
-        return None, None
-    img_np = np.array(img_pil)
-    tensor = CNN_TRANSFORM(img_pil).unsqueeze(0).to(cnn_device)
-    with torch.no_grad():
-        output = cnn_model(tensor)
-        probs = torch.softmax(output, dim=1)[0].cpu().numpy()
-    
-    # Apply Calibration
-    probs = calibrate_probs(probs, img_np)
-    return int(np.argmax(probs)), probs
+        pred_idx, probs = predict_fallback_from_segmentation(np.array(img_pil))
+        return pred_idx, probs, True
+
+    if use_tta:
+        all_probs = []
+        with torch.no_grad():
+            for t in TTA_TRANSFORMS:
+                tensor = t(img_pil.copy()).unsqueeze(0).to(cnn_device)
+                output = cnn_model(tensor)
+                all_probs.append(torch.softmax(output, dim=1)[0].cpu().numpy())
+        probs = np.mean(all_probs, axis=0)
+    else:
+        tensor = CNN_TRANSFORM(img_pil).unsqueeze(0).to(cnn_device)
+        with torch.no_grad():
+            output = cnn_model(tensor)
+            probs = torch.softmax(output, dim=1)[0].cpu().numpy()
+
+    pred_idx = int(probs.argmax())
+    return pred_idx, probs, False
 
 # --- Segmentation Logic ---
 def get_class_masks(img_np, k=8, apply_smoothing=False):
@@ -200,7 +348,9 @@ def get_class_masks(img_np, k=8, apply_smoothing=False):
     return semantic_masks, full_seg
 
 # ===== TABS =====
-tab_main, tab_report, tab_temporal = st.tabs(["Live Classification", "Model Report", "Temporal Analysis"])
+tab_main, tab_report, tab_temporal, tab_batch = st.tabs(
+    ["Live Classification", "Model Report", "Temporal Analysis", "Batch Classification"]
+)
 
 # =============================================
 # TAB 1: MAIN INFERENCE
@@ -212,6 +362,8 @@ with tab_main:
     st.sidebar.header("S-Grade Features")
     apply_smoothing = st.sidebar.checkbox("Enable Spatial Smoothing", value=False,
         help="Uses Median Filtering & Morphological Closing to reduce salt/pepper noise.")
+    enable_tta = st.sidebar.checkbox("Enable Test-Time Augmentation (CNN)", value=False,
+        help="Averages predictions over 5 geometric augmentations for more robust CNN inference.")
 
     # --- System Status ---
     st.sidebar.divider()
@@ -225,9 +377,17 @@ with tab_main:
     st.sidebar.header("Model Selector")
     model_choice = st.sidebar.radio(
         "Select Inference Model",
-        options=["Random Forest (RF)", "CNN (ResNet-18)", "Compare Both"],
+        options=["Random Forest (RF)", "CNN (ResNet-18)", "Compare Both", "Ensemble (RF + CNN)"],
         index=0,
         key="main_model_selector"
+    )
+    ensemble_rf_weight = st.sidebar.slider(
+        "Ensemble RF Weight",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.4,
+        step=0.05,
+        help="Final ensemble = RF_weight * RF + (1 - RF_weight) * CNN",
     )
 
     st.sidebar.divider()
@@ -282,6 +442,9 @@ with tab_main:
 
         with col3:
             st.subheader("Intelligence Report")
+            final_label = None
+            final_conf = None
+            final_model = model_choice
 
             if model_choice == "Compare Both":
                 c_rf, c_cnn = st.columns(2)
@@ -293,15 +456,21 @@ with tab_main:
                     st.success(f"{target_names[pred_rf]}")
                     st.metric("Confidence", f"{probs_rf[pred_rf]*100:.1f}%")
                 with c_cnn:
-                    pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img)
-                    st.markdown("**CNN (ResNet-18)**" + (" (Fallback)" if cnn_is_fallback else ""))
+                    pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img, use_tta=enable_tta)
+                    st.markdown("**CNN (ResNet-18)**" + (" (TTA)" if enable_tta and not cnn_is_fallback else "") + (" (Fallback)" if cnn_is_fallback else ""))
                     if cnn_is_fallback:
                         st.info("CNN model file missing, using segmentation-based fallback predictor.")
                     st.success(f"{target_names[pred_cnn]}")
                     st.metric("Confidence", f"{probs_cnn[pred_cnn]*100:.1f}%")
+                    if not cnn_is_fallback:
+                        cam_overlay = get_gradcam_overlay(img, pred_cnn)
+                        if cam_overlay is not None:
+                            st.image(cam_overlay, caption="GradCAM: CNN focus regions", use_container_width=True)
+                    final_label = target_names[pred_cnn]
+                    final_conf = float(probs_cnn[pred_cnn])
 
             elif model_choice == "CNN (ResNet-18)":
-                pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img)
+                pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img, use_tta=enable_tta)
                 if cnn_is_fallback:
                     st.info("CNN model file missing, using segmentation-based fallback predictor.")
                 st.success(f"**Primary Class**: {target_names[pred_cnn]}")
@@ -310,6 +479,38 @@ with tab_main:
                 fig_p = px.bar(prob_df, x='Class', y='Probability', color='Class', color_discrete_map=CLASS_COLORS)
                 fig_p.update_layout(showlegend=False, margin=dict(l=0,r=0,b=0,t=30), height=220)
                 st.plotly_chart(fig_p, use_container_width=True)
+                if not cnn_is_fallback:
+                    cam_overlay = get_gradcam_overlay(img, pred_cnn)
+                    if cam_overlay is not None:
+                        st.image(cam_overlay, caption="GradCAM: CNN focus regions", use_container_width=True)
+                final_label = target_names[pred_cnn]
+                final_conf = float(probs_cnn[pred_cnn])
+
+            elif model_choice == "Ensemble (RF + CNN)":
+                pred_ens, probs_ens, mode_used, rf_is_fallback, cnn_is_fallback = get_ensemble_prediction(
+                    img_np,
+                    img,
+                    use_tta=enable_tta,
+                    rf_weight=ensemble_rf_weight,
+                )
+                if mode_used != "ensemble":
+                    st.warning(f"Only one model available, using {mode_used.upper()} output directly.")
+                if rf_is_fallback:
+                    st.info("RF model file missing, using segmentation-based RF fallback.")
+                if cnn_is_fallback:
+                    st.info("CNN model file missing, using segmentation-based CNN fallback.")
+                st.success(f"**Ensemble Class**: {target_names[pred_ens]}")
+                st.info(f"**Ensemble Confidence**: {probs_ens[pred_ens]*100:.1f}%")
+                prob_df = pd.DataFrame({"Class": CLASSES, "Probability": probs_ens})
+                fig_p = px.bar(prob_df, x="Class", y="Probability", color="Class", color_discrete_map=CLASS_COLORS)
+                fig_p.update_layout(showlegend=False, margin=dict(l=0, r=0, b=0, t=30), height=220)
+                st.plotly_chart(fig_p, use_container_width=True)
+                if not cnn_is_fallback:
+                    cam_overlay = get_gradcam_overlay(img, pred_ens)
+                    if cam_overlay is not None:
+                        st.image(cam_overlay, caption="GradCAM: CNN contribution in ensemble", use_container_width=True)
+                final_label = target_names[pred_ens]
+                final_conf = float(probs_ens[pred_ens])
 
             else:  # Random Forest
                 pred_rf, probs_rf, rf_is_fallback = predict_rf(img_np)
@@ -321,6 +522,19 @@ with tab_main:
                 fig_p = px.bar(prob_df, x='Class', y='Probability', color='Class', color_discrete_map=CLASS_COLORS)
                 fig_p.update_layout(showlegend=False, margin=dict(l=0,r=0,b=0,t=30), height=220)
                 st.plotly_chart(fig_p, use_container_width=True)
+                final_label = target_names[pred_rf]
+                final_conf = float(probs_rf[pred_rf])
+
+            if final_label is not None and final_conf is not None:
+                history_item = {
+                    "filename": uploaded_file.name,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "model": final_model,
+                    "prediction": final_label,
+                    "confidence": round(final_conf * 100.0, 2),
+                }
+                if not st.session_state["history"] or st.session_state["history"][-1] != history_item:
+                    st.session_state["history"].append(history_item)
 
         st.divider()
         st.header("Dynamic Semantic Segregation (S-Grade Feature)")
@@ -336,12 +550,46 @@ with tab_main:
                 st.markdown(f"**{labels_list[i]}**")
                 st.image(masks[labels_list[i]], use_container_width=True)
 
+        render_dip_feature_breakdown(img_np)
+
     # Benchmarking
     st.divider()
     st.header("Quick Metrics Preview")
     if METRICS_PATH.exists():
         df = pd.read_csv(METRICS_PATH)
         st.dataframe(df, use_container_width=True)
+    if uploaded_file:
+        with st.expander("Download Results"):
+            st.download_button(
+                "Download Original Image (PNG)",
+                data=pil_to_png_bytes(img),
+                file_name=f"{Path(uploaded_file.name).stem}_original.png",
+                mime="image/png",
+            )
+            st.download_button(
+                "Download Classified Map (PNG)",
+                data=np_rgb_to_png_bytes(full_seg),
+                file_name=f"{Path(uploaded_file.name).stem}_classified.png",
+                mime="image/png",
+            )
+            feature_vec = extract_lulc_features(img_np)
+            feature_df = pd.DataFrame([feature_vec], columns=get_feature_names())
+            st.download_button(
+                "Download Feature Vector (CSV)",
+                data=dataframe_to_csv_bytes(feature_df),
+                file_name=f"{Path(uploaded_file.name).stem}_features.csv",
+                mime="text/csv",
+            )
+
+    with st.expander("Session History"):
+        if st.session_state["history"]:
+            hist_df = pd.DataFrame(st.session_state["history"])
+            st.dataframe(hist_df, use_container_width=True)
+            if st.button("Clear History"):
+                st.session_state["history"] = []
+                st.rerun()
+        else:
+            st.info("No history yet. Run a prediction to populate this table.")
 
 
 # =============================================
@@ -400,6 +648,92 @@ with tab_report:
             )
             st.plotly_chart(fig_radar, use_container_width=True)
 
+        st.subheader("Interactive Confusion Matrix")
+        selected_cm_model = st.selectbox(
+            "Select confusion matrix source",
+            ["Random Forest (RF)", "CNN (ResNet-18)"],
+            key="cm_selector",
+        )
+        cm_path = CONFUSION_RF_PATH if selected_cm_model == "Random Forest (RF)" else CONFUSION_CNN_PATH
+        cm_df = load_confusion_matrix(cm_path)
+        if cm_df is None:
+            st.warning(f"Missing `{cm_path.name}`. Add this CSV to `report/` to enable confusion-matrix analytics.")
+        else:
+            cm_values = cm_df.values.astype(float)
+            total = cm_values.sum()
+            perc = (cm_values / total * 100.0) if total > 0 else np.zeros_like(cm_values)
+            annot = np.array(
+                [[f"{int(cm_values[i, j])}<br>{perc[i, j]:.1f}%" for j in range(cm_values.shape[1])]
+                 for i in range(cm_values.shape[0])]
+            )
+            fig_cm = go.Figure(
+                data=go.Heatmap(
+                    z=cm_values,
+                    x=cm_df.columns.tolist(),
+                    y=cm_df.index.tolist(),
+                    colorscale="Blues",
+                    text=annot,
+                    texttemplate="%{text}",
+                    hovertemplate="True: %{y}<br>Pred: %{x}<br>Count: %{z}<extra></extra>",
+                )
+            )
+            fig_cm.update_layout(title="Confusion Matrix (count + %)", xaxis_title="Predicted", yaxis_title="True")
+            st.plotly_chart(fig_cm, use_container_width=True)
+
+            y_true = []
+            y_pred = []
+            for i in range(cm_values.shape[0]):
+                for j in range(cm_values.shape[1]):
+                    count = int(cm_values[i, j])
+                    y_true.extend([i] * count)
+                    y_pred.extend([j] * count)
+            if y_true:
+                p, r, f1, support = precision_recall_fscore_support(
+                    y_true,
+                    y_pred,
+                    labels=list(range(len(cm_df.index))),
+                    zero_division=0,
+                )
+                class_df = pd.DataFrame(
+                    {
+                        "Class": cm_df.index.tolist(),
+                        "Precision": p,
+                        "Recall": r,
+                        "F1": f1,
+                        "Support": support,
+                    }
+                )
+                st.dataframe(class_df, use_container_width=True)
+
+        st.subheader("RF Feature Importance")
+        if rf_model is None or not hasattr(rf_model, "feature_importances_"):
+            st.warning("RF model is not loaded or does not expose feature importances.")
+        else:
+            importances = np.array(rf_model.feature_importances_)
+            group_df = get_feature_group_importance(importances).sort_values("Importance", ascending=True)
+            fig_group = px.bar(
+                group_df,
+                x="Importance",
+                y="Group",
+                orientation="h",
+                title="Grouped Feature Importance",
+                color="Group",
+            )
+            fig_group.update_layout(showlegend=False, margin=dict(l=0, r=0, t=35, b=0))
+            st.plotly_chart(fig_group, use_container_width=True)
+
+            feat_names = get_feature_names()
+            top_idx = np.argsort(importances)[-15:][::-1]
+            top_df = pd.DataFrame(
+                {
+                    "Feature": [feat_names[i] for i in top_idx],
+                    "Importance": importances[top_idx],
+                }
+            )
+            fig_top = px.bar(top_df, x="Feature", y="Importance", title="Top-15 RF Features")
+            fig_top.update_layout(xaxis_tickangle=-45, margin=dict(l=0, r=0, t=35, b=0))
+            st.plotly_chart(fig_top, use_container_width=True)
+
         # --- Written Interpretation ---
         st.subheader("Academic Interpretation")
         st.markdown("""
@@ -410,6 +744,14 @@ with tab_report:
 
         **Conclusion:** This ablation study conclusively validates the architectural progression: DIP features provide the foundation, ML exploits them via structured learning, and Deep Learning surpasses both by discovering hierarchical geometric representations autonomously.
         """)
+
+        with st.expander("Download Results"):
+            st.download_button(
+                "Download Metrics Table (CSV)",
+                data=dataframe_to_csv_bytes(df_metrics),
+                file_name="metrics_table.csv",
+                mime="text/csv",
+            )
 
 
 # =============================================
@@ -592,3 +934,96 @@ with tab_temporal:
         Statistical testing confirms these changes are <b>{"significant at p<0.05" if p_value < 0.05 else "not statistically significant"}</b>.
         </div>
         """, unsafe_allow_html=True)
+
+        with st.expander("Download Results"):
+            st.download_button(
+                "Download Change Heatmap (PNG)",
+                data=np_rgb_to_png_bytes(heatmap),
+                file_name=f"change_heatmap_{t1_label}_{t2_label}.png",
+                mime="image/png",
+            )
+            st.download_button(
+                "Download Transition Summary (CSV)",
+                data=dataframe_to_csv_bytes(df_trans),
+                file_name=f"transition_summary_{t1_label}_{t2_label}.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                "Download Sankey (HTML)",
+                data=fig_sankey.to_html(include_plotlyjs="cdn").encode("utf-8"),
+                file_name=f"sankey_{t1_label}_{t2_label}.html",
+                mime="text/html",
+            )
+
+
+# =============================================
+# TAB 4: BATCH CLASSIFICATION
+# =============================================
+with tab_batch:
+    st.title("Batch Classification")
+    st.markdown("Upload multiple image patches and process them in one run.")
+
+    batch_model = st.selectbox(
+        "Batch Inference Model",
+        ["Random Forest (RF)", "CNN (ResNet-18)", "Ensemble (RF + CNN)"],
+        key="batch_model_selector",
+    )
+    batch_use_tta = st.checkbox("Enable TTA for batch CNN/Ensemble", value=False)
+    batch_rf_weight = st.slider("Batch Ensemble RF Weight", 0.0, 1.0, 0.4, 0.05)
+
+    batch_files = st.file_uploader(
+        "Upload multiple image patches",
+        type=["jpg", "png", "tiff"],
+        accept_multiple_files=True,
+        key="batch_uploader",
+    )
+
+    if batch_files:
+        progress = st.progress(0.0)
+        rows = []
+        for idx, file in enumerate(batch_files):
+            pil_img = Image.open(file).convert("RGB")
+            img_np = np.array(pil_img)
+
+            if batch_model == "Random Forest (RF)":
+                pred_idx, probs, _ = predict_rf(img_np)
+            elif batch_model == "CNN (ResNet-18)":
+                pred_idx, probs, _ = predict_cnn(pil_img, use_tta=batch_use_tta)
+            else:
+                pred_idx, probs, _, _, _ = get_ensemble_prediction(
+                    img_np,
+                    pil_img,
+                    use_tta=batch_use_tta,
+                    rf_weight=batch_rf_weight,
+                )
+
+            top2_idx = np.argsort(probs)[-2:][::-1]
+            rows.append(
+                {
+                    "Filename": file.name,
+                    "Predicted Class": CLASSES[pred_idx],
+                    "Confidence": round(float(probs[pred_idx]) * 100.0, 2),
+                    "Top-2 Class": CLASSES[int(top2_idx[1])],
+                }
+            )
+            progress.progress((idx + 1) / len(batch_files))
+
+        batch_df = pd.DataFrame(rows)
+        st.dataframe(batch_df, use_container_width=True)
+
+        fig_pie = px.pie(
+            batch_df["Predicted Class"].value_counts().reset_index(name="Count"),
+            names="Predicted Class",
+            values="Count",
+            title="Batch Prediction Distribution",
+            color="Predicted Class",
+            color_discrete_map=CLASS_COLORS,
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.download_button(
+            "Download Batch Results (CSV)",
+            data=dataframe_to_csv_bytes(batch_df),
+            file_name="batch_results.csv",
+            mime="text/csv",
+        )
