@@ -31,4 +31,20 @@ def extract_lulc_features(img_np):
     hog_features = hog(gray, orientations=8, pixels_per_cell=(16, 16),
                       cells_per_block=(1, 1), visualize=False)
     
-    return np.hstack([color_features, glcm_features, lbp_hist, hog_features])
+    # 5. Advanced Spectral Indices (RGB-based surrogates) - 4 features
+    # Helps distinguish Water (high relative Blue) from Shadows (neutral low intensity)
+    R, G, B = img_rgb[:,:,0].astype(float), img_rgb[:,:,1].astype(float), img_rgb[:,:,2].astype(float)
+    total = R + G + B + 1e-6
+    
+    # Excess Blue Index (targets Water)
+    exb = np.mean((2*B - R - G) / total)
+    # Blue/Red Ratio (Water usually has higher B/R than shadows)
+    br_ratio = np.mean(B / (R + 1e-6))
+    # Excess Green Index (targets Vegetation vs shadows)
+    exg = np.mean((2*G - R - B) / total)
+    # Overall Intensity (Shadows are darker than most water)
+    intensity = np.mean(gray) / 255.0
+    
+    spectral_features = [exb, br_ratio, exg, intensity]
+    
+    return np.hstack([color_features, glcm_features, lbp_hist, hog_features, spectral_features])
