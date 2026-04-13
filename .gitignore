@@ -1,6 +1,7 @@
 # Data
-data/raw/
-data/processed/
+data/
+EuroSAT.zip
+EuroSAT_raw/
 
 # Models
 models/*.pth
