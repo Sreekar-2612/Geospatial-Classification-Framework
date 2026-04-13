@@ -1,0 +1,5 @@
+Method,Accuracy (%)
+DIP Features + RF,84.6
+SVM,75.0
+K-Nearest Neighbors,78.4
+Gradient Boosting (XGB),88.8

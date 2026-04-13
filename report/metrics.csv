@@ -1,0 +1,4 @@
+Model,Accuracy,Macro F1,Mean IoU,Kappa
+Random Forest,0.8460,0.8423,0.7656,0.8122
+ResNet-18 (CNN),0.9495,0.9482,0.8931,0.9392
+K-Means (DIP),0.4780,0.2528,0.1848,0.2193
