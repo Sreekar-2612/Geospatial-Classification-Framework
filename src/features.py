@@ -30,9 +30,9 @@ def extract_lulc_features(img_np):
     lbp_hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 27), range=(0, 26))
     lbp_hist = lbp_hist / (lbp_hist.sum() + 1e-6)
     
-    # 4. HOG Shape ( orientations=8, 16x16 cells) - 128 features (8 * (4*4))
-    # Corrected for scikit-image API
-    hog_features = hog(gray, orientations=8, pixels_per_cell=(16, 16),
+    # 4. HOG Shape (orientations=8, 32x32 pixels_per_cell) - 128 features (8 * (4*4))
+    # For 128x128 image: 128/32 = 4 cells per dimension, 4*4=16 cells, 16*8=128 features
+    hog_features = hog(gray, orientations=8, pixels_per_cell=(32, 32),
                       cells_per_block=(1, 1), visualize=False)
     
     # 5. Pseudo-NDVI Statistics - 4 features

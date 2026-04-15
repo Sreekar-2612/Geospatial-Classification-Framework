@@ -19,9 +19,55 @@ from sklearn.metrics import precision_recall_fscore_support
 
 # Path fixes
 sys.path.append(str(Path(__file__).parents[1]))
-from src.features import extract_lulc_features
+from src.features import extract_lulc_features as _extract_lulc_features_orig
 from src.utils import METRICS_PATH
 from src.gradcam import GradCAM, overlay_cam_on_image
+
+def extract_lulc_features(img_np):
+    """Wrapper to ensure correct 180-feature extraction with HOG (32,32)"""
+    # Ensure 128x128 or resize
+    if img_np.shape[0] != 128 or img_np.shape[1] != 128:
+        img_np = cv2.resize(img_np, (128, 128))
+        
+    img_rgb = img_np
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    
+    # 1. Color Features (Means & Stds) - 6 features
+    color_features = np.hstack([np.mean(img_rgb, axis=(0, 1)), np.std(img_rgb, axis=(0, 1))])
+    
+    # 2. GLCM Texture (multi-angle) - 16 features (4 props x 4 angles)
+    from skimage.feature import graycomatrix, graycoprops
+    angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+    glcm = graycomatrix(gray, [1], angles, 256, symmetric=True, normed=True)
+    glcm_features = []
+    for prop in ['contrast', 'energy', 'homogeneity', 'correlation']:
+        vals = graycoprops(glcm, prop)[0]
+        glcm_features.extend(vals)
+    
+    # 3. LBP Texture (Uniform) - 26 features
+    from skimage.feature import local_binary_pattern
+    lbp = local_binary_pattern(gray, 24, 3, method='uniform')
+    lbp_hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 27), range=(0, 26))
+    lbp_hist = lbp_hist / (lbp_hist.sum() + 1e-6)
+    
+    # 4. HOG Shape (orientations=8, 32x32 pixels_per_cell) - 128 features
+    from skimage.feature import hog as hog_extract
+    hog_features = hog_extract(gray, orientations=8, pixels_per_cell=(32, 32),
+                               cells_per_block=(1, 1), visualize=False)
+    
+    # 5. Pseudo-NDVI Statistics - 4 features
+    R = img_rgb[:, :, 0].astype(np.float32)
+    G = img_rgb[:, :, 1].astype(np.float32)
+    denom = G + R
+    denom[denom == 0] = 1.0
+    ndvi = (G - R) / denom
+    ndvi_features = np.array([ndvi.mean(), ndvi.std(), ndvi.min(), ndvi.max()])
+    
+    features = np.hstack([color_features, glcm_features, lbp_hist, hog_features, ndvi_features])
+    
+    # Verify we have exactly 180 features
+    assert len(features) == 180, f"Expected 180 features, got {len(features)}"
+    return features
 
 # --- Setup ---
 st.set_page_config(page_title="LULC Intelligence Dashboard", layout="wide")
@@ -35,6 +81,43 @@ st.markdown("""
 
 # --- Constants ---
 CLASSES = ["Agriculture", "Buildings", "Forest", "Roads", "Water"]
+RAW_CLASSES = ["AnnualCrop", "Forest", "HerbaceousVegetation", "Highway", "Industrial", "Pasture", "PermanentCrop", "Residential", "River", "SeaLake"]
+
+# Mapping from 10 raw classes to 5 dashboard classes
+RAW_TO_DASHBOARD = {
+    "AnnualCrop": "Agriculture",      # 0 → 0
+    "Pasture": "Agriculture",         # 5 → 0
+    "PermanentCrop": "Agriculture",   # 6 → 0
+    "HerbaceousVegetation": "Agriculture", # 2 → 0
+    "Residential": "Buildings",       # 7 → 1
+    "Industrial": "Buildings",        # 4 → 1
+    "Forest": "Forest",               # 1 → 2
+    "Highway": "Roads",               # 3 → 3
+    "River": "Water",                 # 8 → 4
+    "SeaLake": "Water",               # 9 → 4
+}
+
+# Index mapping: position in RAW_CLASSES → indices to aggregate
+CLASS_MAPPING = {
+    0: 0,  # Agriculture (AnnualCrop)
+    1: 2,  # Forest
+    2: 0,  # Agriculture (HerbaceousVegetation)
+    3: 3,  # Roads (Highway)
+    4: 1,  # Buildings (Industrial)
+    5: 0,  # Agriculture (Pasture)
+    6: 0,  # Agriculture (PermanentCrop)
+    7: 1,  # Buildings (Residential)
+    8: 4,  # Water (River)
+    9: 4,  # Water (SeaLake)
+}
+
+def aggregate_10_to_5_classes(probs_10):
+    """Map 10-class model output (RAW_CLASSES) to 5-class dashboard output (CLASSES)"""
+    probs_5 = np.zeros(5, dtype=np.float32)
+    for raw_idx, dashboard_idx in CLASS_MAPPING.items():
+        probs_5[dashboard_idx] += probs_10[raw_idx]
+    return probs_5 / probs_5.sum()
+
 CLASS_COLORS = {
     "Agriculture": "#639922", "Buildings": "#888780",
     "Forest": "#1D9E75", "Roads": "#444441", "Water": "#378ADD"
@@ -64,27 +147,62 @@ def load_rf():
 
 @st.cache_resource
 def load_cnn():
-    """Load CNN model from saved state dict (ResNet-18)"""
+    """Load CNN model from saved state dict (auto-detect architecture)"""
     path = MODELS_DIR / "cnn_final.pth"
     if not path.exists():
+        print(f"❌ CNN model file not found: {path}")
         return None, None
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     try:
-        # Create ResNet-18 architecture (matches what's saved)
-        model = models.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
-        
-        # Load the state_dict
+        # Load state dict and determine model type
         state_dict = torch.load(path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
         
+        # Print some keys for debugging
+        keys_sample = list(state_dict.keys())[:5]
+        print(f"Model keys sample: {keys_sample}")
+        
+        # Check if it's EfficientNet or ResNet based on keys
+        if "features.0.0.weight" in state_dict or "features.1.0.block" in state_dict or "features.0.1.weight" in state_dict:
+            # EfficientNet architecture
+            print(f"✓ Detected EfficientNet-B1")
+            model = models.efficientnet_b1(weights=None)
+            # Get output classes from classifier weight
+            classifier_keys = [k for k in state_dict.keys() if k.startswith("classifier")]
+            if classifier_keys:
+                # Find the output layer weight
+                for key in classifier_keys:
+                    if key.endswith(".weight"):
+                        num_classes = state_dict[key].shape[0]
+                        break
+            else:
+                num_classes = 10  # fallback
+            
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+            print(f"   Output classes: {num_classes}")
+        elif "layer1.0.conv1.weight" in state_dict or "layer4.1" in str(state_dict.keys()):
+            # ResNet architecture
+            print(f"✓ Detected ResNet-18")
+            model = models.resnet18(weights=None)
+            num_classes = state_dict.get("fc.weight").shape[0]
+            model.fc = nn.Linear(model.fc.in_features, num_classes)
+            print(f"   Output classes: {num_classes}")
+        else:
+            print(f"❌ Unknown model architecture. Keys: {list(state_dict.keys())[:10]}")
+            return None, None
+        
+        # Load the state dict
+        model.load_state_dict(state_dict)
         model = model.to(device)
         model.eval()
+        print(f"✓ Model loaded successfully")
         return model, device
         
     except Exception as e:
+        print(f"❌ Failed to load CNN: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None, None
 
 rf_model, rf_scaler = load_rf()
@@ -148,36 +266,27 @@ def dataframe_to_csv_bytes(df):
 
 
 def get_feature_group_importance(importances):
-    """Calculate grouped feature importance, adapting to actual feature count"""
+    """Calculate grouped feature importance (180 features)"""
     num_features = len(importances)
     
-    # Dynamic ranges based on actual feature count
-    # Standard feature order: Color (6) + GLCM + LBP + HOG (128) + NDVI (4)
+    # Standard feature order: Color (6) + GLCM (16) + LBP (26) + HOG (128) + NDVI (4) = 180
     if num_features >= 180:
         groups = {
             "Color Stats": (0, 6),
-            "GLCM": (6, 22),
-            "LBP": (22, 48),
-            "HOG": (48, 176),
+            "GLCM Texture": (6, 22),
+            "LBP Texture": (22, 48),
+            "HOG Shape": (48, 176),
             "Pseudo-NDVI": (176, 180),
         }
-    elif num_features >= 156:
-        # Fallback model: Color(6) + GLCM(8) + LBP(10) + HOG(128) + NDVI(4) = 156
-        groups = {
-            "Color Stats": (0, 6),
-            "GLCM": (6, 14),
-            "LBP": (14, 24),
-            "HOG": (24, 152),
-            "Pseudo-NDVI": (152, 156),
-        }
     else:
-        # Generic fallback
+        # Fallback for other feature counts
+        per_group = num_features // 5
         groups = {
-            "Color Stats": (0, min(6, num_features)),
-            "GLCM": (min(6, num_features), min(22, num_features)),
-            "LBP": (min(22, num_features), min(48, num_features)),
-            "HOG": (min(48, num_features), min(176, num_features)),
-            "Pseudo-NDVI": (min(176, num_features), num_features),
+            "Color Stats": (0, per_group),
+            "GLCM Texture": (per_group, 2*per_group),
+            "LBP Texture": (2*per_group, 3*per_group),
+            "HOG Shape": (3*per_group, 4*per_group),
+            "Pseudo-NDVI": (4*per_group, num_features),
         }
     
     rows = []
@@ -188,7 +297,7 @@ def get_feature_group_importance(importances):
 
 
 def get_feature_names():
-    """Generate feature names matching the actual feature extraction"""
+    """Generate feature names matching the actual feature extraction (180 total)"""
     names = [
         "mean_R",
         "mean_G",
@@ -197,21 +306,25 @@ def get_feature_names():
         "std_G",
         "std_B",
     ]
-    # GLCM features (fallback uses 8: 4 correlations + 4 stats)
-    glcm_features = ["corr_1,0", "corr_0,1", "corr_1,1", "corr_1,-1", 
-                     "gray_mean", "gray_std", "gray_max", "gray_min"]
-    names.extend(glcm_features)
     
-    # LBP features (fallback uses 10)
-    for i in range(10):
+    # GLCM features (16: 4 properties x 4 angles)
+    # Properties: contrast, energy, homogeneity, correlation
+    # Angles: 0, π/4, π/2, 3π/4
+    glcm_props = ["contrast", "energy", "homogeneity", "correlation"]
+    for prop in glcm_props:
+        for angle_idx in range(4):
+            names.append(f"glcm_{prop}_angle{angle_idx}")
+    
+    # LBP features (26: uniform histogram bins)
+    for i in range(26):
         names.append(f"lbp_bin_{i}")
     
-    # HOG features (128)
+    # HOG features (128: 8 orientations x (4x4 cells) = 8 * 16 = 128)
     for i in range(128):
         names.append(f"hog_{i}")
     
     # NDVI features (4)
-    names.extend(["ndvi_mean", "ndvi_std", "ndvi_max", "ndvi_min"])
+    names.extend(["ndvi_mean", "ndvi_std", "ndvi_min", "ndvi_max"])
     
     return names
 
@@ -242,7 +355,7 @@ def render_dip_feature_breakdown(img_np):
             _, hog_vis = hog(
                 gray,
                 orientations=8,
-                pixels_per_cell=(16, 16),
+                pixels_per_cell=(32, 32),
                 cells_per_block=(1, 1),
                 visualize=True,
             )
@@ -325,11 +438,33 @@ def predict_rf(img_np):
         return pred_idx, probs, True
     feat = extract_lulc_features(img_np)
     feat_arr = np.array([feat])
-    if rf_scaler is not None:
+    
+    # Only apply scaler if feature count matches (model retraining needed otherwise)
+    if rf_scaler is not None and rf_scaler.n_features_in_ == feat_arr.shape[1]:
         feat_arr = rf_scaler.transform(feat_arr)
-    pred_idx = rf_model.predict(feat_arr)[0]
-    probs = rf_model.predict_proba(feat_arr)[0]
-    return pred_idx, probs, False
+    elif rf_scaler is not None:
+        print(f"⚠️ Scaler mismatch: expects {rf_scaler.n_features_in_} features, got {feat_arr.shape[1]}. RF model needs retraining!")
+        # Use fallback predictor instead
+        pred_idx, probs = predict_fallback_from_segmentation(img_np)
+        return pred_idx, probs, True
+    
+    try:
+        pred_10 = rf_model.predict(feat_arr)[0]
+        probs_10 = rf_model.predict_proba(feat_arr)[0]
+    except Exception as e:
+        print(f"⚠️ RF prediction failed: {e}. Using fallback")
+        pred_idx, probs = predict_fallback_from_segmentation(img_np)
+        return pred_idx, probs, True
+    
+    # Map 10-class output to 5-class dashboard output
+    if len(probs_10) == 10:
+        probs_5 = aggregate_10_to_5_classes(probs_10)
+        pred_idx = int(probs_5.argmax())
+    else:
+        probs_5 = probs_10
+        pred_idx = pred_10
+    
+    return pred_idx, probs_5, False
 
 def predict_cnn(img_pil, use_tta=False):
     if cnn_model is None:
@@ -343,14 +478,21 @@ def predict_cnn(img_pil, use_tta=False):
                 tensor = t(img_pil.copy()).unsqueeze(0).to(cnn_device)
                 output = cnn_model(tensor)
                 all_probs.append(torch.softmax(output, dim=1)[0].cpu().numpy())
-        probs = np.mean(all_probs, axis=0)
+        probs_raw = np.mean(all_probs, axis=0)
     else:
         tensor = CNN_TRANSFORM(img_pil).unsqueeze(0).to(cnn_device)
         with torch.no_grad():
             output = cnn_model(tensor)
-            probs = torch.softmax(output, dim=1)[0].cpu().numpy()
+            probs_raw = torch.softmax(output, dim=1)[0].cpu().numpy()
 
-    pred_idx = int(probs.argmax())
+    # Map 10-class output to 5-class dashboard output
+    if len(probs_raw) == 10:
+        probs = aggregate_10_to_5_classes(probs_raw)
+        pred_idx = int(probs.argmax())
+    else:
+        probs = probs_raw
+        pred_idx = int(probs_raw.argmax())
+    
     return pred_idx, probs, False
 
 # --- Segmentation Logic ---
@@ -403,7 +545,6 @@ with tab_main:
     st.title("Land Use and Land Cover Classification Dashboard")
 
     # --- Sidebar ---
-    st.sidebar.header("S-Grade Features")
     apply_smoothing = st.sidebar.checkbox("Enable Spatial Smoothing", value=False,
         help="Uses Median Filtering & Morphological Closing to reduce salt/pepper noise.")
     enable_tta = st.sidebar.checkbox("Enable Test-Time Augmentation (CNN)", value=False,
@@ -421,7 +562,7 @@ with tab_main:
     st.sidebar.header("Model Selector")
     model_choice = st.sidebar.radio(
         "Select Inference Model",
-        options=["Random Forest (RF)", "CNN (ResNet-18)", "Compare Both", "Ensemble (RF + CNN)"],
+        options=["Random Forest (RF)", "CNN (EfficientNet-B1)", "Compare Both", "Ensemble (RF + CNN)"],
         index=0,
         key="main_model_selector"
     )
@@ -501,7 +642,7 @@ with tab_main:
                     st.metric("Confidence", f"{probs_rf[pred_rf]*100:.1f}%")
                 with c_cnn:
                     pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img, use_tta=enable_tta)
-                    st.markdown("**CNN (ResNet-18)**" + (" (TTA)" if enable_tta and not cnn_is_fallback else "") + (" (Fallback)" if cnn_is_fallback else ""))
+                    st.markdown("**CNN (EfficientNet-B1)**" + (" (TTA)" if enable_tta and not cnn_is_fallback else "") + (" (Fallback)" if cnn_is_fallback else ""))
                     if cnn_is_fallback:
                         st.info("CNN model file missing, using segmentation-based fallback predictor.")
                     st.success(f"{target_names[pred_cnn]}")
@@ -513,7 +654,7 @@ with tab_main:
                     final_label = target_names[pred_cnn]
                     final_conf = float(probs_cnn[pred_cnn])
 
-            elif model_choice == "CNN (ResNet-18)":
+            elif model_choice == "CNN (EfficientNet-B1)":
                 pred_cnn, probs_cnn, cnn_is_fallback = predict_cnn(img, use_tta=enable_tta)
                 if cnn_is_fallback:
                     st.info("CNN model file missing, using segmentation-based fallback predictor.")
@@ -581,7 +722,7 @@ with tab_main:
                     st.session_state["history"].append(history_item)
 
         st.divider()
-        st.header("Dynamic Semantic Segregation (S-Grade Feature)")
+        st.header("Dynamic Semantic Segregation")
         st.markdown("""
         **How to read this:** The algorithm separates the image into 8 spectral clusters.
         It dynamically merges identical clusters and maps them to real-world labels.
@@ -695,7 +836,7 @@ with tab_report:
         st.subheader("Interactive Confusion Matrix")
         selected_cm_model = st.selectbox(
             "Select confusion matrix source",
-            ["Random Forest (RF)", "CNN (ResNet-18)"],
+            ["Random Forest (RF)", "CNN (EfficientNet-B1)"],
             key="cm_selector",
         )
         cm_path = CONFUSION_RF_PATH if selected_cm_model == "Random Forest (RF)" else CONFUSION_CNN_PATH
@@ -789,7 +930,7 @@ with tab_report:
         st.subheader("Academic Interpretation")
         st.markdown("""
         **Key Findings:**
-        - **CNN (ResNet-18)** dominates across all metrics. Its multi-layered convolutional filters learn spatial context (building shapes, road linearity) that purely statistical ML classifiers cannot capture from handcrafted features alone.
+        - **CNN (EfficientNet-B1)** dominates across all metrics. Its multi-layered convolutional filters learn spatial context (building shapes, road linearity) that purely statistical ML classifiers cannot capture from handcrafted features alone.
         - **Random Forest** performs competitively given its feature vector input (GLCM + LBP + HOG + Pseudo-NDVI), demonstrating that well-engineered classical features can partially substitute for deep learned representations.
         - **K-Means (DIP)** unsupervised clustering underperforms significantly. Without labeled supervision, cluster assignments are arbitrary — the algorithm has no prior knowledge to distinguish spectrally similar classes like Agriculture vs. Forest.
 
@@ -806,7 +947,7 @@ with tab_report:
 
 
 # =============================================
-# TAB 3: TEMPORAL ANALYSIS (S-GRADE FEATURE)
+# TAB 3: TEMPORAL ANALYSIS
 # =============================================
 with tab_temporal:
     st.title("Temporal Land Cover Intelligence Analyser")
@@ -819,7 +960,7 @@ with tab_temporal:
     t2_label = st.sidebar.text_input("T2 Label (Present)", value="2024")
     pixel_scale = st.sidebar.number_input("Pixel Scale (m/px)", value=10, min_value=1)
     sankey_threshold = st.sidebar.slider("Sankey Threshold (%)", 0.0, 20.0, 1.0)
-    temp_model = st.sidebar.selectbox("Analysis Engine", ["CNN (ResNet-18)", "Random Forest (RF)"])
+    temp_model = st.sidebar.selectbox("Analysis Engine", ["CNN (EfficientNet-B1)", "Random Forest (RF)"])
     show_unchanged = st.sidebar.toggle("Show Unchanged Pixels in Heatmap", value=True)
 
     up_col1, up_col2 = st.columns(2)
@@ -1016,7 +1157,7 @@ with tab_batch:
 
     batch_model = st.selectbox(
         "Batch Inference Model",
-        ["Random Forest (RF)", "CNN (ResNet-18)", "Ensemble (RF + CNN)"],
+        ["Random Forest (RF)", "CNN (EfficientNet-B1)", "Ensemble (RF + CNN)"],
         key="batch_model_selector",
     )
     batch_use_tta = st.checkbox("Enable TTA for batch CNN/Ensemble", value=False)
@@ -1038,7 +1179,7 @@ with tab_batch:
 
             if batch_model == "Random Forest (RF)":
                 pred_idx, probs, _ = predict_rf(img_np)
-            elif batch_model == "CNN (ResNet-18)":
+            elif batch_model == "CNN (EfficientNet-B1)":
                 pred_idx, probs, _ = predict_cnn(pil_img, use_tta=batch_use_tta)
             else:
                 pred_idx, probs, _, _, _ = get_ensemble_prediction(
