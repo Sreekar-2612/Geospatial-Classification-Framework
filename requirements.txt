@@ -7,10 +7,7 @@ scikit-learn
 torch
 torchvision
 streamlit
-tifffile
-rasterio
 plotly
 pillow
 scipy
-kaggle
 scikit-image
