@@ -46,7 +46,7 @@ TARGET_CLASSES_LIST = [
     ("Buildings/Urban", [180, 180, 180], [255, 255, 255]),
     ("Roads/Pavement", [110, 110, 110], [128, 128, 128]),
     ("Forest/Parks", [45, 65, 40], [34, 139, 34]),
-    ("Water Bodies", [20, 40, 100], [30, 144, 255]),
+    ("Water Bodies", [15, 45, 80], [30, 144, 255]),
     ("Agriculture/Grass", [100, 115, 80], [154, 205, 50]),
     ("Shadows/Unknown", [30, 30, 35], [40, 40, 40])
 ]
@@ -64,25 +64,34 @@ def load_rf():
 
 @st.cache_resource
 def load_cnn():
+    """Load CNN model from saved state dict (ResNet-18)"""
     path = MODELS_DIR / "cnn_final.pth"
     if not path.exists():
         return None, None
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
+    
     try:
-        model.load_state_dict(torch.load(path, map_location=device))
-    except RuntimeError:
+        # Create ResNet-18 architecture (matches what's saved)
+        model = models.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
+        
+        # Load the state_dict
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        
+        model = model.to(device)
+        model.eval()
+        return model, device
+        
+    except Exception as e:
         return None, None
-    model.to(device)
-    model.eval()
-    return model, device
 
 rf_model, rf_scaler = load_rf()
 cnn_model, cnn_device = load_cnn()
 
 CNN_TRANSFORM = transforms.Compose([
-    transforms.Resize((64, 64)),
+    transforms.Resize((128, 128)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -90,25 +99,25 @@ CNN_TRANSFORM = transforms.Compose([
 TTA_TRANSFORMS = [
     CNN_TRANSFORM,
     transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.RandomHorizontalFlip(p=1.0),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]),
     transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.RandomVerticalFlip(p=1.0),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]),
     transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.RandomRotation((90, 90)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]),
     transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.RandomRotation((270, 270)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -139,20 +148,47 @@ def dataframe_to_csv_bytes(df):
 
 
 def get_feature_group_importance(importances):
-    groups = {
-        "Color Stats": (0, 6),
-        "GLCM": (6, 22),
-        "LBP": (22, 48),
-        "HOG": (48, 176),
-        "Pseudo-NDVI": (176, 180),
-    }
+    """Calculate grouped feature importance, adapting to actual feature count"""
+    num_features = len(importances)
+    
+    # Dynamic ranges based on actual feature count
+    # Standard feature order: Color (6) + GLCM + LBP + HOG (128) + NDVI (4)
+    if num_features >= 180:
+        groups = {
+            "Color Stats": (0, 6),
+            "GLCM": (6, 22),
+            "LBP": (22, 48),
+            "HOG": (48, 176),
+            "Pseudo-NDVI": (176, 180),
+        }
+    elif num_features >= 156:
+        # Fallback model: Color(6) + GLCM(8) + LBP(10) + HOG(128) + NDVI(4) = 156
+        groups = {
+            "Color Stats": (0, 6),
+            "GLCM": (6, 14),
+            "LBP": (14, 24),
+            "HOG": (24, 152),
+            "Pseudo-NDVI": (152, 156),
+        }
+    else:
+        # Generic fallback
+        groups = {
+            "Color Stats": (0, min(6, num_features)),
+            "GLCM": (min(6, num_features), min(22, num_features)),
+            "LBP": (min(22, num_features), min(48, num_features)),
+            "HOG": (min(48, num_features), min(176, num_features)),
+            "Pseudo-NDVI": (min(176, num_features), num_features),
+        }
+    
     rows = []
     for name, (start, end) in groups.items():
-        rows.append({"Group": name, "Importance": float(importances[start:end].sum())})
+        if start < end <= num_features:
+            rows.append({"Group": name, "Importance": float(importances[start:end].sum())})
     return pd.DataFrame(rows)
 
 
 def get_feature_names():
+    """Generate feature names matching the actual feature extraction"""
     names = [
         "mean_R",
         "mean_G",
@@ -161,14 +197,22 @@ def get_feature_names():
         "std_G",
         "std_B",
     ]
-    for prop in ["contrast", "energy", "homogeneity", "correlation"]:
-        for angle in ["0", "45", "90", "135"]:
-            names.append(f"glcm_{prop}_{angle}")
-    for i in range(26):
+    # GLCM features (fallback uses 8: 4 correlations + 4 stats)
+    glcm_features = ["corr_1,0", "corr_0,1", "corr_1,1", "corr_1,-1", 
+                     "gray_mean", "gray_std", "gray_max", "gray_min"]
+    names.extend(glcm_features)
+    
+    # LBP features (fallback uses 10)
+    for i in range(10):
         names.append(f"lbp_bin_{i}")
+    
+    # HOG features (128)
     for i in range(128):
         names.append(f"hog_{i}")
-    names.extend(["ndvi_mean", "ndvi_std", "ndvi_min", "ndvi_max"])
+    
+    # NDVI features (4)
+    names.extend(["ndvi_mean", "ndvi_std", "ndvi_max", "ndvi_min"])
+    
     return names
 
 
@@ -723,6 +767,13 @@ with tab_report:
             st.plotly_chart(fig_group, use_container_width=True)
 
             feat_names = get_feature_names()
+            
+            # Ensure feat_names has enough entries for all features in the model
+            # Extend with generic names if needed
+            while len(feat_names) < len(importances):
+                feat_names.append(f"feature_{len(feat_names)}")
+            
+            # Get top 15 features, ensuring indices are valid
             top_idx = np.argsort(importances)[-15:][::-1]
             top_df = pd.DataFrame(
                 {

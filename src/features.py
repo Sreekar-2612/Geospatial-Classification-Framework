@@ -7,9 +7,9 @@ def extract_lulc_features(img_np):
     Standardized feature extraction for LULC classification.
     Expects RGB image (np.array).
     """
-    # Ensure 64x64 or resize for consistency if needed (EuroSAT is 64x64)
-    if img_np.shape[0] != 64 or img_np.shape[1] != 64:
-        img_np = cv2.resize(img_np, (64, 64))
+    # Ensure 128x128 or resize for consistency (improved from 64x64)
+    if img_np.shape[0] != 128 or img_np.shape[1] != 128:
+        img_np = cv2.resize(img_np, (128, 128))
         
     img_rgb = img_np
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)

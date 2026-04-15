@@ -139,12 +139,22 @@ def train_rf(mapped_dir):
     sys.path.insert(0, str(PROJECT_ROOT))
     from src.features import extract_lulc_features
 
+    # Filter to classes with actual data
+    all_classes = sorted([d.name for d in mapped_dir.iterdir() if d.is_dir()])
+    classes_with_data = [cls for cls in all_classes if any((mapped_dir / cls).glob("*.jpg"))]
+    
+    if not classes_with_data:
+        print("No images found in mapped dataset!")
+        return 0.0
+    
+    print(f"Found {len(classes_with_data)} classes with data: {classes_with_data}")
+
     data = []
     labels = []
-    classes = sorted([d.name for d in mapped_dir.iterdir() if d.is_dir()])
+    class_to_idx = {cls: i for i, cls in enumerate(classes_with_data)}
 
-    print(f"Feature extraction for classes: {classes}")
-    for i, cls in enumerate(classes):
+    print(f"Feature extraction for classes: {classes_with_data}")
+    for i, cls in enumerate(classes_with_data):
         paths = list((mapped_dir / cls).glob("*.jpg"))
         for img_path in tqdm(paths, desc=f"  {cls}"):
             img = cv2.imread(str(img_path))
@@ -180,7 +190,7 @@ def train_rf(mapped_dir):
     acc = accuracy_score(y_test, rf.predict(X_test))
     print(f"\nRF Test Accuracy: {acc * 100:.2f}%")
     print("\nClassification Report:")
-    print(classification_report(y_test, rf.predict(X_test), target_names=classes))
+    print(classification_report(y_test, rf.predict(X_test), target_names=classes_with_data))
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     rf_path = MODELS_DIR / "rf_baseline.joblib"
@@ -194,8 +204,8 @@ def train_rf(mapped_dir):
 
 
 def train_cnn(mapped_dir):
-    """Train CNN (ResNet-18) with class-balanced sampling, strong augmentation,
-    cosine LR, and a two-phase freeze/unfreeze strategy."""
+    """Train CNN (EfficientNet-B1) with class-balanced sampling, strong augmentation,
+    warmup, cosine LR, and a two-phase freeze/unfreeze strategy."""
     print("\n" + "=" * 60)
     print("Training CNN (ResNet-18) Model — Tuned")
     print("=" * 60)
@@ -204,25 +214,44 @@ def train_cnn(mapped_dir):
     print(f"Using device: {device}")
 
     train_transform = transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(30),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+        transforms.RandomRotation(45),
+        transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.15, scale=(0.02, 0.15)),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
     ])
 
     eval_transform = transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((128, 128)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    full_dataset = datasets.ImageFolder(str(mapped_dir), transform=None)
+    # Filter to classes with actual images
+    all_classes = sorted([d.name for d in mapped_dir.iterdir() if d.is_dir()])
+    classes_with_data = [cls for cls in all_classes if any((mapped_dir / cls).glob("*.jpg"))]
+    
+    if not classes_with_data:
+        print("No images found for CNN training!")
+        return 0.0
+    
+    # Create a temporary dataset directory with only classes that have data
+    temp_dataset_dir = PROJECT_ROOT / "data" / "temp_dataset"
+    temp_dataset_dir.mkdir(parents=True, exist_ok=True)
+    for cls in classes_with_data:
+        (temp_dataset_dir / cls).mkdir(exist_ok=True)
+        for img in (mapped_dir / cls).glob("*.jpg"):
+            import shutil as sh
+            target = temp_dataset_dir / cls / img.name
+            if not target.exists():
+                sh.copy2(str(img), str(target))
+    
+    full_dataset = datasets.ImageFolder(str(temp_dataset_dir), transform=None)
     class_names = full_dataset.classes
     num_classes = len(class_names)
     print(f"Classes: {class_names} ({num_classes} classes)")
@@ -265,9 +294,9 @@ def train_cnn(mapped_dir):
         num_epochs = 20
         batch_sz = 32
     else:
-        num_epochs = 30
-        batch_sz = 64
-    freeze_epochs = 5
+        num_epochs = 50
+        batch_sz = 128
+    freeze_epochs = 3
     print(f"Training for {num_epochs} epochs (backbone frozen for first {freeze_epochs}), batch size {batch_sz}")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_sz, sampler=sampler, num_workers=0)
@@ -275,23 +304,23 @@ def train_cnn(mapped_dir):
     test_loader = DataLoader(test_dataset, batch_size=batch_sz, shuffle=False, num_workers=0)
 
     # --- Model setup with two-phase freeze/unfreeze ---
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.DEFAULT)
+    model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
     model = model.to(device)
 
     for param in model.parameters():
         param.requires_grad = False
-    for param in model.fc.parameters():
+    for param in model.classifier.parameters():
         param.requires_grad = True
 
     criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
 
-    optimizer = optim.AdamW(model.fc.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    optimizer = optim.AdamW(model.classifier.parameters(), lr=5e-3, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-7)
 
     best_val_acc = 0.0
     patience_counter = 0
-    early_stop_patience = 8
+    early_stop_patience = 12
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODELS_DIR / "cnn_final.pth"
 
@@ -302,11 +331,11 @@ def train_cnn(mapped_dir):
             for param in model.parameters():
                 param.requires_grad = True
             optimizer = optim.AdamW([
-                {"params": model.fc.parameters(), "lr": 5e-4},
+                {"params": model.classifier.parameters(), "lr": 2e-3},
                 {"params": (p for n, p in model.named_parameters()
-                            if "fc" not in n and p.requires_grad), "lr": 5e-5},
+                            if "classifier" not in n and p.requires_grad), "lr": 1e-4},
             ], weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - freeze_epochs, eta_min=1e-6)
+            scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - freeze_epochs, eta_min=1e-7)
 
         model.train()
         running_loss = 0.0
