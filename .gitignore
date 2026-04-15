@@ -3,10 +3,10 @@ data/raw/
 data/processed/
 
 # Models
-models/*.pth
-models/*.joblib
-models/*.pkl
-models/*.pickle
+# models/*.pth
+# models/*.joblib
+# models/*.pkl
+# models/*.pickle
 
 # Python
 __pycache__/
