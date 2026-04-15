@@ -1,2 +1,0 @@
-# Deployment to Streamlit Cloud typically doesn't need these when using opencv-python-headless.
-# Leaving this file empty to avoid APT dependency conflicts.
