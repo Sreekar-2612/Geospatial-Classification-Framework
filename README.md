@@ -33,7 +33,7 @@ The core "Brain" spans 5 meticulously structured notebooks:
 1. **`01_data_exploration.ipynb`**: Execution of Exploratory Data Analysis (EDA). Provides statistical class distributions, spectral signature visualizations, and an initial introduction to spectral index generation (Pseudo-NDVI).
 2. **`02_dip_techniques.ipynb`**: Implementation of Advanced DIP. Applies feature extraction techniques such as Gray-Level Co-occurrence Matrix (**GLCM**) for statistical textures, Local Binary Patterns (**LBP**) for spatial patterns, and Histogram of Oriented Gradients (**HOG**) to map edges and structural geometries.
 3. **`03_ml_baseline.ipynb`**: Deployment of algorithmic baselines. Uses the consolidated `src.features` pipeline to train powerful classifiers including **Random Forest (RF)**, Support Vector Machines (SVM), K-Nearest Neighbors (KNN), and Gradient Boosting (XGBoost logic). 
-4. **`04_deep_learning.ipynb`**: Implemented a complete **ResNet-18 PyTorch training loop**, alongside **GradCAM feature visualization** to build S-Grade spatial interpretability by explaining exactly where the network looks for a classification.
+4. **`04_deep_learning.ipynb`**: Implemented a complete **ResNet-18 PyTorch training loop**, alongside **GradCAM feature visualization** to build advanced spatial interpretability by explaining exactly where the network looks for a classification.
 5. **`05_advanced_analysis.ipynb`**: Constructed an automated **Change Detection simulation** to precisely map urban expansions (new structures), and built a **Pseudo-NDBI** spectral index calculator extracting built-up infrastructures purely from RGB imagery using geometric channel differences.
 
 ### 4. 🚀 The Interactive Streamlit Dashboard (`app/main.py`)
@@ -53,7 +53,7 @@ A flagship deployment that blends real-time AI classification with qualitative c
    - **EuroSAT RGB**: Leveraging the 3-band version strictly to provide seamless visualization across standard screens and to maximize real-time edge processing speeds without requiring specialized TIF handlers.
 2. **Feature Extraction Focus**:
    - The analysis inherently assumes standardizing images into $64 \times 64$ patches. Contextual topology (how buildings interact with roads) proves much more effective than solitary pixel matching.
-3. **S-Grade Feature Engineering**:
+3. **Feature Engineering**:
    - Includes rigorous ablation validation—proving explicitly why certain models outperform others by cross-examining classical DIP vs ML vs Deep Learning topologies within the same unified testing structure.
 
 ---
