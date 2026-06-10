@@ -1,7 +1,7 @@
 # 🛰️ Land Use & Land Cover (LULC) Classification Intelligence Dashboard
 
 ## 📌 Project Overview
-This project is an advanced, high-performance Land Use and Land Cover (LULC) classification system focused on **Satellite Imagery Analysis**. Engineered for a Digital Image Processing (DIP) course, it is designed with an **S-Grade** target, combining traditional Computer Vision methods with state-of-the-art Deep Learning models. 
+This project is an advanced, high-performance Land Use and Land Cover (LULC) classification system focused on **Satellite Imagery Analysis**. Engineered for a Digital Image Processing (DIP) course, it is designed by combining traditional Computer Vision methods with state-of-the-art Deep Learning models. 
 
 The primary goal is the semantic segmentation and systematic classification of remote sensing data (EuroSAT RGB dataset) into **6 fundamental topographic categories**:
 1.  **Water Bodies** (Rivers, Lakes, Seas)
